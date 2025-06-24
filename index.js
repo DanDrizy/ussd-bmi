@@ -4,6 +4,12 @@ const { Pool } = require("pg");
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
+// Logging middleware (moved to top)
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`, req.body);
+  next();
+});
+
 // PostgreSQL pool setup with your connection string
 const pool = new Pool({
   connectionString: "postgresql://neondb_owner:npg_9Zzi7NRVQIvF@ep-tiny-scene-a8imp2sk-pooler.eastus2.azure.neon.tech/neondb?sslmode=require",
@@ -99,47 +105,6 @@ function getBMITips(bmi, lang) {
   return getMessage(lang, 'obese_tips');
 }
 
-function getStateFromInput(user, steps, currentStep) {
-  if (!user) {
-    return currentStep === 0 ? STATES.LANGUAGE_SELECTION : STATES.WEIGHT_INPUT;
-  }
-
-  // For existing users, determine state based on their current_state and input
-  switch (user.current_state) {
-    case STATES.LANGUAGE_SELECTION:
-      return STATES.PREVIOUS_RECORD;
-    case STATES.PREVIOUS_RECORD:
-      return steps[steps.length - 1] === '1' ? STATES.WEIGHT_INPUT : null; // null means exit
-    case STATES.WEIGHT_INPUT:
-      return STATES.HEIGHT_INPUT;
-    case STATES.HEIGHT_INPUT:
-      return STATES.BMI_RESULT;
-    case STATES.BMI_RESULT:
-      return STATES.TIPS_SELECTION;
-    case STATES.TIPS_SELECTION:
-      return null; // End of flow
-    default:
-      return STATES.PREVIOUS_RECORD;
-  }
-}
-
-function handleBackButton(user, steps) {
-  if (!user) {
-    return steps.length <= 1 ? STATES.LANGUAGE_SELECTION : STATES.WEIGHT_INPUT;
-  }
-
-  switch (user.current_state) {
-    case STATES.HEIGHT_INPUT:
-      return STATES.WEIGHT_INPUT;
-    case STATES.BMI_RESULT:
-      return STATES.HEIGHT_INPUT;
-    case STATES.TIPS_SELECTION:
-      return STATES.BMI_RESULT;
-    default:
-      return STATES.PREVIOUS_RECORD;
-  }
-}
-
 // Use async handler for express POST route
 app.post("/", async (req, res) => {
   const { sessionId, phoneNumber, text } = req.body;
@@ -147,133 +112,62 @@ app.post("/", async (req, res) => {
   let input = steps[steps.length - 1];
   let currentStep = steps.length;
 
+  // Handle back button (0)
   if (input === "0" && currentStep > 1) {
-    steps = steps.slice(0, -2);
-    currentStep = steps.length;
+    steps.pop(); // Remove the "0"
     input = steps[steps.length - 1] || "";
+    currentStep = steps.length;
   }
 
+  let client;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
 
-    // Get user by phoneNumber
-    const userResult = await client.query(
+    // Get or create user
+    let userResult = await client.query(
       "SELECT * FROM users WHERE phone_number = $1",
       [phoneNumber]
     );
-    const user = userResult.rows[0];
+    let user = userResult.rows[0];
 
-    // Determine current state
-    let currentState;
-    if (input === "0" && currentStep >= 1) {
-      currentState = handleBackButton(user, steps);
-    } else {
-      currentState = getStateFromInput(user, steps, currentStep);
+    // First time user - language selection
+    if (!user && currentStep === 0) {
+      res.send("CON " + getMessage('en', 'welcome'));
+      return;
     }
 
-    switch (currentState) {
+    // Create user after language selection
+    if (!user && currentStep === 1 && (input === "1" || input === "2")) {
+      const lang = input === "2" ? "rw" : "en";
+      const insertResult = await client.query(
+        "INSERT INTO users (phone_number, language, current_state) VALUES ($1, $2, $3) RETURNING *",
+        [phoneNumber, lang, STATES.WEIGHT_INPUT]
+      );
+      user = insertResult.rows[0];
+      res.send("CON " + getMessage(lang, 'weight_input'));
+      return;
+    }
+
+    // If user doesn't exist at this point, something went wrong
+    if (!user) {
+      res.send("CON " + getMessage('en', 'welcome'));
+      return;
+    }
+
+    // Handle existing user flow based on their current state
+    switch (user.current_state) {
       case STATES.LANGUAGE_SELECTION:
-        res.send("CON " + getMessage('en', 'welcome'));
-        break;
-
-      case STATES.WEIGHT_INPUT:
-        if (!user && currentStep === 1) {
-          const lang = steps[0] === "2" ? "rw" : "en";
-          await client.query(
-            "INSERT INTO users (phone_number, language, current_state) VALUES ($1, $2, $3)",
-            [phoneNumber, lang, STATES.WEIGHT_INPUT]
-          );
-          res.send("CON " + getMessage(lang, 'weight_input'));
-        } else if (user) {
-          await client.query(
-            "UPDATE users SET current_state = $1 WHERE id = $2",
-            [STATES.WEIGHT_INPUT, user.id]
-          );
-          res.send("CON " + getMessage(user.language, 'weight_input'));
-        }
-        break;
-
-      case STATES.HEIGHT_INPUT:
-        if (!validateWeight(input)) {
-          res.send("CON " + getMessage(user.language, 'invalid_weight'));
-          break;
-        }
-        await client.query(
-          "UPDATE users SET current_state = $1 WHERE id = $2",
-          [STATES.HEIGHT_INPUT, user.id]
-        );
-        res.send("CON " + getMessage(user.language, 'height_input'));
-        break;
-
-      case STATES.BMI_RESULT:
-        if (!validateHeight(input)) {
-          res.send("CON " + getMessage(user.language, 'invalid_height'));
-          break;
-        }
-        const weight = parseFloat(steps[steps.length - 2]);
-        const height = parseFloat(input);
-        const bmi = calculateBMI(weight, height);
-        const status = getBMIStatus(bmi, user.language);
-
-        await client.query(
-          "INSERT INTO results (user_id, weight, height, bmi) VALUES ($1, $2, $3, $4)",
-          [user.id, weight, height, bmi]
-        );
-
-        await client.query(
-          "UPDATE users SET current_state = $1 WHERE id = $2",
-          [STATES.BMI_RESULT, user.id]
-        );
-
-        const message = `Your BMI is ${bmi}. ${status}\n${getMessage(user.language, 'tips_question')}`;
-        res.send("CON " + message);
-        break;
-
-      case STATES.TIPS_SELECTION:
-        if (input === "1") {
-          const resultRes = await client.query(
-            "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
-            [user.id]
-          );
-          const result = resultRes.rows[0];
-          if (!result) {
-            res.send("END " + getMessage(user.language, 'db_error'));
-            break;
-          }
-          const tips = getBMITips(result.bmi, user.language);
-
-          await client.query(
-            "UPDATE users SET current_state = $1 WHERE id = $2",
-            [STATES.PREVIOUS_RECORD, user.id]
-          );
-
-          res.send("END " + tips);
-        } else if (input === "2") {
-          await client.query(
-            "UPDATE users SET current_state = $1 WHERE id = $2",
-            [STATES.PREVIOUS_RECORD, user.id]
-          );
-          res.send("END " + getMessage(user.language, 'thank_you'));
-        } else {
-          res.send(
-            "CON " +
-            getMessage(user.language, 'invalid_input') +
-            "\n" +
-            getMessage(user.language, 'tips_question')
-          );
-        }
-        break;
-
       case STATES.PREVIOUS_RECORD:
-        // Handle language selection for existing users
+        // Language selection for existing users
         if (currentStep === 1 && (input === "1" || input === "2")) {
           const lang = input === "2" ? "rw" : "en";
           await client.query(
-            "UPDATE users SET language = $1, current_state = $2 WHERE id = $3",
-            [lang, STATES.PREVIOUS_RECORD, user.id]
+            "UPDATE users SET language = $1 WHERE id = $2",
+            [lang, user.id]
           );
+          user.language = lang; // Update local object
           
-          // Show previous record after language update
+          // Show previous record
           const lastResultRes = await client.query(
             "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
             [user.id]
@@ -289,13 +183,14 @@ app.post("/", async (req, res) => {
             const msg = `Last BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(lang, 'new_check')}`;
             res.send("CON " + msg);
           } else {
+            // No previous record, go to weight input
             await client.query(
               "UPDATE users SET current_state = $1 WHERE id = $2",
               [STATES.WEIGHT_INPUT, user.id]
             );
             res.send("CON " + getMessage(lang, 'weight_input'));
           }
-          break;
+          return;
         }
 
         // Handle new check or exit options
@@ -310,7 +205,7 @@ app.post("/", async (req, res) => {
           // User wants to exit
           res.send("END " + getMessage(user.language, 'thank_you'));
         } else {
-          // Invalid input - show previous record again
+          // Invalid input or first visit - show previous record
           const lastResultRes = await client.query(
             "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
             [user.id]
@@ -323,9 +218,12 @@ app.post("/", async (req, res) => {
             const height = lastResult.height;
             const status = getBMIStatus(bmi, user.language);
 
-            const msg = `${getMessage(user.language, 'invalid_input')}\n\nLast BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(user.language, 'new_check')}`;
+            const msg = input ? 
+              `${getMessage(user.language, 'invalid_input')}\n\nLast BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(user.language, 'new_check')}` :
+              `Last BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(user.language, 'new_check')}`;
             res.send("CON " + msg);
           } else {
+            // No previous record, go to weight input
             await client.query(
               "UPDATE users SET current_state = $1 WHERE id = $2",
               [STATES.WEIGHT_INPUT, user.id]
@@ -335,30 +233,136 @@ app.post("/", async (req, res) => {
         }
         break;
 
-      case null:
-        if (user) {
+      case STATES.WEIGHT_INPUT:
+        if (!validateWeight(input)) {
+          res.send("CON " + getMessage(user.language, 'invalid_weight'));
+          return;
+        }
+        
+        await client.query(
+          "UPDATE users SET current_state = $1 WHERE id = $2",
+          [STATES.HEIGHT_INPUT, user.id]
+        );
+        res.send("CON " + getMessage(user.language, 'height_input'));
+        break;
+
+      case STATES.HEIGHT_INPUT:
+        if (!validateHeight(input)) {
+          res.send("CON " + getMessage(user.language, 'invalid_height'));
+          return;
+        }
+
+        // Get weight from previous step
+        const weightStep = steps[steps.length - 2];
+        if (!validateWeight(weightStep)) {
+          // Reset to weight input if weight is invalid
+          await client.query(
+            "UPDATE users SET current_state = $1 WHERE id = $2",
+            [STATES.WEIGHT_INPUT, user.id]
+          );
+          res.send("CON " + getMessage(user.language, 'weight_input'));
+          return;
+        }
+
+        const weight = parseFloat(weightStep);
+        const height = parseFloat(input);
+        const bmi = calculateBMI(weight, height);
+        const status = getBMIStatus(bmi, user.language);
+
+        // Save BMI result
+        await client.query(
+          "INSERT INTO results (user_id, weight, height, bmi) VALUES ($1, $2, $3, $4)",
+          [user.id, weight, height, bmi]
+        );
+
+        await client.query(
+          "UPDATE users SET current_state = $1 WHERE id = $2",
+          [STATES.BMI_RESULT, user.id]
+        );
+
+        const message = `Your BMI is ${bmi}. ${status}\n${getMessage(user.language, 'tips_question')}`;
+        res.send("CON " + message);
+        break;
+
+      case STATES.BMI_RESULT:
+        await client.query(
+          "UPDATE users SET current_state = $1 WHERE id = $2",
+          [STATES.TIPS_SELECTION, user.id]
+        );
+        
+        if (input === "1") {
+          // Show tips
+          const resultRes = await client.query(
+            "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            [user.id]
+          );
+          const result = resultRes.rows[0];
+          
+          if (!result) {
+            res.send("END " + getMessage(user.language, 'db_error'));
+            return;
+          }
+          
+          const tips = getBMITips(result.bmi, user.language);
           await client.query(
             "UPDATE users SET current_state = $1 WHERE id = $2",
             [STATES.PREVIOUS_RECORD, user.id]
           );
+          res.send("END " + tips);
+        } else if (input === "2") {
+          // No tips wanted
+          await client.query(
+            "UPDATE users SET current_state = $1 WHERE id = $2",
+            [STATES.PREVIOUS_RECORD, user.id]
+          );
+          res.send("END " + getMessage(user.language, 'thank_you'));
+        } else {
+          // Invalid input - ask again
+          const resultRes = await client.query(
+            "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            [user.id]
+          );
+          const result = resultRes.rows[0];
+          
+          if (result) {
+            const bmi = result.bmi;
+            const status = getBMIStatus(bmi, user.language);
+            const message = `Your BMI is ${bmi}. ${status}\n${getMessage(user.language, 'invalid_input')}\n${getMessage(user.language, 'tips_question')}`;
+            res.send("CON " + message);
+          } else {
+            res.send("END " + getMessage(user.language, 'db_error'));
+          }
         }
-        res.send("END " + getMessage(user ? user.language : 'en', 'thank_you'));
+        break;
+
+      case STATES.TIPS_SELECTION:
+        // This shouldn't happen normally, but handle it
+        await client.query(
+          "UPDATE users SET current_state = $1 WHERE id = $2",
+          [STATES.PREVIOUS_RECORD, user.id]
+        );
+        res.send("END " + getMessage(user.language, 'thank_you'));
         break;
 
       default:
-        res.send("END " + getMessage(user ? user.language : 'en', 'invalid_input'));
+        // Reset to previous record state
+        await client.query(
+          "UPDATE users SET current_state = $1 WHERE id = $2",
+          [STATES.PREVIOUS_RECORD, user.id]
+        );
+        
+        // Show language selection for fresh start
+        res.send("CON " + getMessage(user.language || 'en', 'welcome'));
     }
 
-    client.release();
   } catch (error) {
     console.error("Application error:", error);
     res.send("END " + getMessage('en', 'db_error'));
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
-});
-
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`, req.body);
-  next();
 });
 
 const PORT = process.env.PORT || 3000;
