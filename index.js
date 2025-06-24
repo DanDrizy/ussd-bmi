@@ -109,7 +109,7 @@ function getStateFromInput(user, steps, currentStep) {
     case STATES.LANGUAGE_SELECTION:
       return STATES.PREVIOUS_RECORD;
     case STATES.PREVIOUS_RECORD:
-      return steps[1] === '1' ? STATES.WEIGHT_INPUT : null; // null means exit
+      return steps[steps.length - 1] === '1' ? STATES.WEIGHT_INPUT : null; // null means exit
     case STATES.WEIGHT_INPUT:
       return STATES.HEIGHT_INPUT;
     case STATES.HEIGHT_INPUT:
@@ -265,26 +265,73 @@ app.post("/", async (req, res) => {
         break;
 
       case STATES.PREVIOUS_RECORD:
-        const lastResultRes = await client.query(
-          "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
-          [user.id]
-        );
-        const lastResult = lastResultRes.rows[0];
+        // Handle language selection for existing users
+        if (currentStep === 1 && (input === "1" || input === "2")) {
+          const lang = input === "2" ? "rw" : "en";
+          await client.query(
+            "UPDATE users SET language = $1, current_state = $2 WHERE id = $3",
+            [lang, STATES.PREVIOUS_RECORD, user.id]
+          );
+          
+          // Show previous record after language update
+          const lastResultRes = await client.query(
+            "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            [user.id]
+          );
+          const lastResult = lastResultRes.rows[0];
 
-        if (lastResult) {
-          const bmi = lastResult.bmi;
-          const weight = lastResult.weight;
-          const height = lastResult.height;
-          const status = getBMIStatus(bmi, user.language);
+          if (lastResult) {
+            const bmi = lastResult.bmi;
+            const weight = lastResult.weight;
+            const height = lastResult.height;
+            const status = getBMIStatus(bmi, lang);
 
-          const msg = `Last BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(user.language, 'new_check')}`;
-          res.send("CON " + msg);
-        } else {
+            const msg = `Last BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(lang, 'new_check')}`;
+            res.send("CON " + msg);
+          } else {
+            await client.query(
+              "UPDATE users SET current_state = $1 WHERE id = $2",
+              [STATES.WEIGHT_INPUT, user.id]
+            );
+            res.send("CON " + getMessage(lang, 'weight_input'));
+          }
+          break;
+        }
+
+        // Handle new check or exit options
+        if (input === "1") {
+          // User wants to do a new BMI check
           await client.query(
             "UPDATE users SET current_state = $1 WHERE id = $2",
             [STATES.WEIGHT_INPUT, user.id]
           );
           res.send("CON " + getMessage(user.language, 'weight_input'));
+        } else if (input === "2") {
+          // User wants to exit
+          res.send("END " + getMessage(user.language, 'thank_you'));
+        } else {
+          // Invalid input - show previous record again
+          const lastResultRes = await client.query(
+            "SELECT * FROM results WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            [user.id]
+          );
+          const lastResult = lastResultRes.rows[0];
+
+          if (lastResult) {
+            const bmi = lastResult.bmi;
+            const weight = lastResult.weight;
+            const height = lastResult.height;
+            const status = getBMIStatus(bmi, user.language);
+
+            const msg = `${getMessage(user.language, 'invalid_input')}\n\nLast BMI: ${bmi} (${status})\nWeight: ${weight}kg, Height: ${height}cm\n${getMessage(user.language, 'new_check')}`;
+            res.send("CON " + msg);
+          } else {
+            await client.query(
+              "UPDATE users SET current_state = $1 WHERE id = $2",
+              [STATES.WEIGHT_INPUT, user.id]
+            );
+            res.send("CON " + getMessage(user.language, 'weight_input'));
+          }
         }
         break;
 
